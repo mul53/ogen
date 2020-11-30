@@ -1,10 +1,9 @@
 package bls
 
 import (
-	"encoding/binary"
 	"errors"
 	"github.com/dgraph-io/ristretto"
-	bls12 "github.com/herumi/bls-eth-go-binary/bls"
+	"github.com/kilic/bls12-381"
 	"github.com/olympus-protocol/ogen/pkg/params"
 )
 
@@ -21,10 +20,6 @@ var (
 	ErrorSigSize = errors.New("signature should be 96 bytes")
 	// ErrorSigUnmarshal returned when the pubkey is not valid
 	ErrorSigUnmarshal = errors.New("could not unmarshal bytes into signature")
-	// ErrInfinitePubKey returned when the pubkey is zero
-	ErrInfinitePubKey = errors.New("public key is zero")
-	// ErrZeroSecKey returned when the secret key is zero
-	ErrZeroSecKey = errors.New("secret key is zero")
 )
 
 var maxKeys = int64(100000)
@@ -33,6 +28,12 @@ var pubkeyCache, _ = ristretto.NewCache(&ristretto.Config{
 	MaxCost:     1 << 22, // ~4mb is cache max size
 	BufferItems: 64,
 })
+
+var engine *bls12381.Engine
+
+func init() {
+	engine = bls12381.NewEngine()
+}
 
 // KeyPair is an interface struct to serve keypairs
 type KeyPair struct {
@@ -46,15 +47,6 @@ func Initialize(c *params.ChainParams) {
 	Prefix = c.AccountPrefixes
 }
 
-func init() {
-	if err := bls12.Init(bls12.BLS12_381); err != nil {
-		panic(err)
-	}
-	if err := bls12.SetETHmode(bls12.EthModeDraft07); err != nil {
-		panic(err)
-	}
-}
-
 // PublicKeyFromBytes creates a BLS public key from a  BigEndian byte slice.
 func PublicKeyFromBytes(pubKey []byte) (*PublicKey, error) {
 	if len(pubKey) != 48 {
@@ -63,20 +55,13 @@ func PublicKeyFromBytes(pubKey []byte) (*PublicKey, error) {
 	if cv, ok := pubkeyCache.Get(string(pubKey)); ok {
 		return cv.(*PublicKey).Copy(), nil
 	}
-	if cv, ok := pubkeyCache.Get(string(pubKey)); ok {
-		return cv.(*PublicKey).Copy(), nil
-	}
-	p := &bls12.PublicKey{}
-	err := p.Deserialize(pubKey)
+	p, err := bls12381.NewG1().FromCompressed(pubKey)
 	if err != nil {
 		return nil, ErrorPubKeyUnmarshal
 	}
-	pubKeyObj := &PublicKey{p: p}
-	if pubKeyObj.IsInfinite() {
-		return nil, ErrInfinitePubKey
-	}
-	pubkeyCache.Set(string(pubKey), pubKeyObj.Copy(), 48)
-	return pubKeyObj, nil
+	obj := &PublicKey{p: p}
+	pubkeyCache.Set(string(pubKey), obj.Copy(), 48)
+	return obj, nil
 }
 
 // AggregatePublicKeys aggregates the provided raw public keys into a single key.
@@ -103,17 +88,17 @@ func SignatureFromBytes(sig []byte) (*Signature, error) {
 	if len(sig) != 96 {
 		return nil, ErrorSigSize
 	}
-	signature := &bls12.Sign{}
-	err := signature.Deserialize(sig)
+	g2 := bls12381.NewG2()
+	s, err := g2.FromCompressed(sig)
 	if err != nil {
 		return nil, ErrorSigUnmarshal
 	}
-	return &Signature{s: signature}, nil
+	return &Signature{s: s}, nil
 }
 
 // NewAggregateSignature creates a blank aggregate signature.
 func NewAggregateSignature() *Signature {
-	return &Signature{s: bls12.HashAndMapToSignature([]byte{'m', 'o', 'c', 'k'})}
+	return &Signature{s: &bls12381.PointG2{}}
 }
 
 // AggregateSignatures converts a list of signatures into a single, aggregated sig.
@@ -123,7 +108,7 @@ func AggregateSignatures(sigs []*Signature) *Signature {
 	}
 	signature := *sigs[0].Copy().s
 	for i := 1; i < len(sigs); i++ {
-		signature.Add(sigs[i].s)
+		//	signature.Add(sigs[i].s)
 	}
 	return &Signature{s: &signature}
 }
@@ -150,61 +135,59 @@ func Aggregate(sigs []*Signature) *Signature {
 // P'_{i,j} = P_{i,j} * r_i
 // e(S*, G) = \prod_{i=1}^n \prod_{j=1}^{m_i} e(P'_{i,j}, M_{i,j})
 // Using this we can verify multiple signatures safely.
-func VerifyMultipleSignatures(sigs []*Signature, msgs [][32]byte, pubKeys []*PublicKey) (bool, error) {
-	if len(sigs) == 0 || len(pubKeys) == 0 {
-		return false, nil
-	}
-	length := len(sigs)
-	if length != len(pubKeys) || length != len(msgs) {
-		return false, errors.New("provided signatures, pubkeys and messages have differing lengths")
-	}
-	// Use a secure source of RNG.
-	newGen := NewGenerator()
-	randNums := make([]bls12.Fr, length)
-	signatures := make([]bls12.G2, length)
-	msgSlices := make([]byte, 0, 32*len(msgs))
-	for i := 0; i < len(sigs); i++ {
-		rNum := newGen.Uint64()
-		b := make([]byte, 8)
-		binary.LittleEndian.PutUint64(b, rNum)
-		if err := randNums[i].SetLittleEndian(b); err != nil {
-			return false, err
-		}
-		// Cast signature to a G2 value
-		signatures[i] = *bls12.CastFromSign(sigs[i].s)
-
-		// Flatten message to single byte slice to make it compatible with herumi.
-		msgSlices = append(msgSlices, msgs[i][:]...)
-	}
-	// Perform multi scalar multiplication on all the relevant G2 points
-	// with our generated random numbers.
-	finalSig := new(bls12.G2)
-	bls12.G2MulVec(finalSig, signatures, randNums)
-
-	multiKeys := make([]bls12.PublicKey, length)
-	for i := 0; i < len(pubKeys); i++ {
-		if pubKeys[i] == nil {
-			return false, errors.New("nil public key")
-		}
-		// Perform scalar multiplication for the corresponding g1 points.
-		g1 := new(bls12.G1)
-		bls12.G1Mul(g1, bls12.CastFromPublicKey(pubKeys[i].p), &randNums[i])
-		multiKeys[i] = *bls12.CastToPublicKey(g1)
-	}
-	aggSig := bls12.CastToSign(finalSig)
-
-	return aggSig.AggregateVerifyNoCheck(multiKeys, msgSlices), nil
-}
+//func VerifyMultipleSignatures(sigs []*Signature, msgs [][32]byte, pubKeys []*PublicKey) (bool, error) {
+//	if len(sigs) == 0 || len(pubKeys) == 0 {
+//		return false, nil
+//	}
+//	length := len(sigs)
+//	if length != len(pubKeys) || length != len(msgs) {
+//		return false, errors.New("provided signatures, pubkeys and messages have differing lengths")
+//	}
+//	// Use a secure source of RNG.
+//	newGen := NewGenerator()
+//	randNums := make([]bls12.Fr, length)
+//	signatures := make([]bls12.G2, length)
+//	msgSlices := make([]byte, 0, 32*len(msgs))
+//	for i := 0; i < len(sigs); i++ {
+//		rNum := newGen.Uint64()
+//		b := make([]byte, 8)
+//		binary.LittleEndian.PutUint64(b, rNum)
+//		if err := randNums[i].SetLittleEndian(b); err != nil {
+//			return false, err
+//		}
+//		// Cast signature to a G2 value
+//		signatures[i] = *bls12.CastFromSign(sigs[i].s)
+//
+//		// Flatten message to single byte slice to make it compatible with herumi.
+//		msgSlices = append(msgSlices, msgs[i][:]...)
+//	}
+//	// Perform multi scalar multiplication on all the relevant G2 points
+//	// with our generated random numbers.
+//	finalSig := new(bls12.G2)
+//	bls12.G2MulVec(finalSig, signatures, randNums)
+//
+//	multiKeys := make([]bls12.PublicKey, length)
+//	for i := 0; i < len(pubKeys); i++ {
+//		if pubKeys[i] == nil {
+//			return false, errors.New("nil public key")
+//		}
+//		// Perform scalar multiplication for the corresponding g1 points.
+//		g1 := new(bls12.G1)
+//		bls12.G1Mul(g1, bls12.CastFromPublicKey(pubKeys[i].p), &randNums[i])
+//		multiKeys[i] = *bls12.CastToPublicKey(g1)
+//	}
+//	aggSig := bls12.CastToSign(finalSig)
+//
+//	return aggSig.AggregateVerifyNoCheck(multiKeys, msgSlices), nil
+//}
 
 // SecretKeyFromBytes creates a BLS private key from a BigEndian byte slice.
 func SecretKeyFromBytes(privKey []byte) (*SecretKey, error) {
 	if len(privKey) != 32 {
 		return nil, ErrorSecSize
 	}
-	secKey := &bls12.SecretKey{}
-	err := secKey.Deserialize(privKey)
-	if err != nil {
-		return nil, ErrorSecUnmarshal
-	}
-	return &SecretKey{p: secKey}, err
+	fr := bls12381.NewFr()
+	fr.FromBytes(privKey)
+	// TODO handle possible errors
+	return &SecretKey{p: fr}, nil
 }

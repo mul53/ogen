@@ -1,7 +1,6 @@
 package bls_test
 
 import (
-	bls12 "github.com/herumi/bls-eth-go-binary/bls"
 	"github.com/olympus-protocol/ogen/pkg/bls"
 	"github.com/stretchr/testify/assert"
 	"testing"

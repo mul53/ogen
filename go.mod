@@ -19,8 +19,9 @@ require (
 	github.com/golang/snappy v0.0.2
 	github.com/google/gofuzz v1.2.0
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.0.1
-	github.com/herumi/bls-eth-go-binary v0.0.0-20201027164522-f7dd8401dd57
+	github.com/herumi/bls-eth-go-binary v0.0.0-20201027164522-f7dd8401dd57 // indirect
 	github.com/ipfs/go-ds-leveldb v0.4.2
+	github.com/kilic/bls12-381 v0.0.0-20201130094822-63668807ad6a
 	github.com/lib/pq v1.8.0
 	github.com/libp2p/go-libp2p v0.11.0
 	github.com/libp2p/go-libp2p-circuit v0.3.1
